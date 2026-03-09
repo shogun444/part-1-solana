@@ -2,6 +2,16 @@ import express, { Request, Response, NextFunction } from "express";
 import { PrismaClient } from "@prisma/client";
 import jwt from "jsonwebtoken";
 import bcryptjs from "bcryptjs";
+import { z } from "zod";
+import {
+  addWhitelistSchema,
+  createLaunchSchema,
+  createReferralSchema,
+  loginSchema,
+  purchaseTokensSchema,
+  registerSchema,
+  updateLaunchSchema,
+} from "./validation";
 
 const app = express();
 const prisma = new PrismaClient();
@@ -45,6 +55,46 @@ interface LaunchWithStatus {
   } | null;
 }
 
+type LaunchStatus = "UPCOMING" | "ACTIVE" | "ENDED" | "SOLD_OUT";
+
+interface PurchaseAmount {
+  amount: number;
+}
+
+interface TierInput {
+  minAmount: number;
+  maxAmount: number;
+  pricePerToken: number;
+}
+
+interface LaunchWithRelations {
+  id: string;
+  creatorId: string;
+  name: string;
+  symbol: string;
+  totalSupply: number;
+  pricePerToken: number;
+  startsAt: Date;
+  endsAt: Date;
+  maxPerWallet: number;
+  description: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  tiers: Array<{
+    id: string;
+    minAmount: number;
+    maxAmount: number;
+    pricePerToken: number;
+  }>;
+  vestingConfig: {
+    id: string;
+    cliffDays: number;
+    vestingDays: number;
+    tgePercent: number;
+  } | null;
+  purchases: PurchaseAmount[];
+}
+
 // ============================================================================
 // MIDDLEWARE
 // ============================================================================
@@ -68,8 +118,19 @@ const authMiddleware = (
     req.user = decoded;
     next();
   } catch {
-    return res.status(401).json({ error: "Invalid token" });
+    return res.status(401).json({ error: "Missing or invalid token" });
   }
+};
+
+const parseBody = <T>(
+  schema: z.ZodType<T>,
+  body: unknown,
+): { success: true; data: T } | { success: false } => {
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) {
+    return { success: false };
+  }
+  return { success: true, data: parsed.data };
 };
 
 // Helper function to compute launch status
@@ -78,12 +139,133 @@ const computeStatus = (launch: {
   endsAt: Date;
   totalSupply: number;
   totalPurchased: number;
-}): "UPCOMING" | "ACTIVE" | "ENDED" | "SOLD_OUT" => {
+}): LaunchStatus => {
   const now = new Date();
   if (launch.totalPurchased >= launch.totalSupply) return "SOLD_OUT";
   if (now < launch.startsAt) return "UPCOMING";
   if (now > launch.endsAt) return "ENDED";
   return "ACTIVE";
+};
+
+const mapLaunchWithStatus = (launch: LaunchWithRelations): LaunchWithStatus => {
+  const totalPurchased = launch.purchases.reduce(
+    (sum, purchase) => sum + purchase.amount,
+    0,
+  );
+  const status = computeStatus({
+    startsAt: launch.startsAt,
+    endsAt: launch.endsAt,
+    totalSupply: launch.totalSupply,
+    totalPurchased,
+  });
+
+  return {
+    id: launch.id,
+    creatorId: launch.creatorId,
+    name: launch.name,
+    symbol: launch.symbol,
+    totalSupply: launch.totalSupply,
+    pricePerToken: launch.pricePerToken,
+    startsAt: launch.startsAt,
+    endsAt: launch.endsAt,
+    maxPerWallet: launch.maxPerWallet,
+    description: launch.description,
+    createdAt: launch.createdAt,
+    updatedAt: launch.updatedAt,
+    status,
+    tiers: launch.tiers,
+    vestingConfig: launch.vestingConfig,
+  };
+};
+
+const calculateTieredCost = (
+  purchaseAmount: number,
+  alreadySold: number,
+  tiers: TierInput[],
+  basePricePerToken: number,
+): number => {
+  if (tiers.length === 0) {
+    return purchaseAmount * basePricePerToken;
+  }
+
+  let remaining = purchaseAmount;
+  let runningSold = alreadySold;
+  let totalCost = 0;
+
+  for (const tier of tiers) {
+    if (remaining <= 0) {
+      break;
+    }
+
+    if (runningSold >= tier.maxAmount) {
+      continue;
+    }
+
+    const filledInTier = Math.max(runningSold, tier.minAmount);
+    const tierRemainingCapacity = Math.max(0, tier.maxAmount - filledInTier);
+    if (tierRemainingCapacity === 0) {
+      continue;
+    }
+
+    const tokensInTier = Math.min(remaining, tierRemainingCapacity);
+    totalCost += tokensInTier * tier.pricePerToken;
+    remaining -= tokensInTier;
+    runningSold += tokensInTier;
+  }
+
+  if (remaining > 0) {
+    totalCost += remaining * basePricePerToken;
+  }
+
+  return totalCost;
+};
+
+const computeVestingState = (params: {
+  totalPurchased: number;
+  firstPurchaseTime: Date;
+  cliffDays: number;
+  vestingDays: number;
+  tgePercent: number;
+}) => {
+  const {
+    totalPurchased,
+    firstPurchaseTime,
+    cliffDays,
+    vestingDays,
+    tgePercent,
+  } = params;
+
+  const tgeAmount = Math.floor((totalPurchased * tgePercent) / 100);
+  const cliffEndsAt = new Date(
+    firstPurchaseTime.getTime() + cliffDays * 24 * 60 * 60 * 1000,
+  );
+  const now = new Date();
+
+  let claimableAmount = tgeAmount;
+  if (now >= cliffEndsAt) {
+    if (vestingDays <= 0) {
+      claimableAmount = totalPurchased;
+    } else {
+      const vestingDurationMs = vestingDays * 24 * 60 * 60 * 1000;
+      const elapsedMs = Math.max(0, now.getTime() - cliffEndsAt.getTime());
+      const linearProgress = Math.min(1, elapsedMs / vestingDurationMs);
+      const linearUnlocked = Math.floor(
+        (totalPurchased - tgeAmount) * linearProgress,
+      );
+      claimableAmount = tgeAmount + linearUnlocked;
+    }
+  }
+
+  claimableAmount = Math.min(totalPurchased, Math.max(0, claimableAmount));
+  const lockedAmount = totalPurchased - claimableAmount;
+
+  return {
+    tgeAmount,
+    cliffEndsAt,
+    vestedAmount: claimableAmount,
+    claimableAmount,
+    lockedAmount,
+  };
 };
 
 // Helper function to get total purchased for a launch
@@ -108,11 +290,12 @@ app.get("/api/health", (req: Request, res: Response) => {
 // ============================================================================
 
 app.post("/api/auth/register", async (req: Request, res: Response) => {
-  const { email, password, name } = req.body;
-
-  if (!email || !password || !name) {
-    return res.status(400).json({ error: "Missing required fields" });
+  const parsed = parseBody(registerSchema, req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid input" });
   }
+
+  const { email, password, name } = parsed.data;
 
   try {
     const existingUser = await prisma.user.findUnique({ where: { email } });
@@ -143,11 +326,12 @@ app.post("/api/auth/register", async (req: Request, res: Response) => {
 });
 
 app.post("/api/auth/login", async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ error: "Missing required fields" });
+  const parsed = parseBody(loginSchema, req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid input" });
   }
+
+  const { email, password } = parsed.data;
 
   try {
     const user = await prisma.user.findUnique({ where: { email } });
@@ -181,6 +365,11 @@ app.post(
   "/api/launches",
   authMiddleware,
   async (req: AuthRequest, res: Response) => {
+    const parsed = parseBody(createLaunchSchema, req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Invalid input" });
+    }
+
     const {
       name,
       symbol,
@@ -192,31 +381,18 @@ app.post(
       description,
       tiers,
       vesting,
-    } = req.body;
-
-    const requiredFields = [
-      name,
-      symbol,
-      totalSupply,
-      pricePerToken,
-      startsAt,
-      endsAt,
-      maxPerWallet,
-    ];
-    if (requiredFields.some((field) => field === undefined || field === null)) {
-      return res.status(400).json({ error: "Missing required fields" });
-    }
+    } = parsed.data;
 
     try {
       const launch = await prisma.launch.create({
         data: {
           name,
           symbol,
-          totalSupply: parseInt(totalSupply),
-          pricePerToken: parseFloat(pricePerToken),
-          startsAt: new Date(startsAt),
-          endsAt: new Date(endsAt),
-          maxPerWallet: parseInt(maxPerWallet),
+          totalSupply,
+          pricePerToken,
+          startsAt,
+          endsAt,
+          maxPerWallet,
           description: description || null,
           creatorId: req.user!.id,
         },
@@ -227,9 +403,9 @@ app.post(
           await prisma.tier.create({
             data: {
               launchId: launch.id,
-              minAmount: parseInt(tier.minAmount),
-              maxAmount: parseInt(tier.maxAmount),
-              pricePerToken: parseFloat(tier.pricePerToken),
+              minAmount: tier.minAmount,
+              maxAmount: tier.maxAmount,
+              pricePerToken: tier.pricePerToken,
             },
           });
         }
@@ -239,16 +415,23 @@ app.post(
         await prisma.vestingConfig.create({
           data: {
             launchId: launch.id,
-            cliffDays: parseInt(vesting.cliffDays),
-            vestingDays: parseInt(vesting.vestingDays),
-            tgePercent: parseInt(vesting.tgePercent),
+            cliffDays: vesting.cliffDays,
+            vestingDays: vesting.vestingDays,
+            tgePercent: vesting.tgePercent,
           },
         });
       }
 
+      const status = computeStatus({
+        startsAt: launch.startsAt,
+        endsAt: launch.endsAt,
+        totalSupply: launch.totalSupply,
+        totalPurchased: 0,
+      });
+
       const responseData = {
         ...launch,
-        status: "UPCOMING" as const,
+        status,
         tiers: tiers || [],
         vestingConfig: vesting || null,
       };
@@ -263,57 +446,53 @@ app.post(
 app.get("/api/launches", async (req: Request, res: Response) => {
   const page = parseInt((req.query.page as string) || "1", 10);
   const limit = parseInt((req.query.limit as string) || "10", 10);
-  const statusFilter = req.query.status as string | undefined;
+  const rawStatusFilter = req.query.status as string | undefined;
+
+  if (
+    !Number.isInteger(page) ||
+    !Number.isInteger(limit) ||
+    page <= 0 ||
+    limit <= 0
+  ) {
+    return res.status(400).json({ error: "Invalid input" });
+  }
 
   const skip = (page - 1) * limit;
+  const validStatuses: LaunchStatus[] = [
+    "UPCOMING",
+    "ACTIVE",
+    "ENDED",
+    "SOLD_OUT",
+  ];
+  const hasStatusQuery = rawStatusFilter !== undefined;
+  const statusFilter = validStatuses.includes(rawStatusFilter as LaunchStatus)
+    ? (rawStatusFilter as LaunchStatus)
+    : null;
 
   try {
-    const launches = await prisma.launch.findMany({
+    const launches = (await prisma.launch.findMany({
       include: {
         tiers: true,
         vestingConfig: true,
         purchases: { select: { amount: true } },
       },
-      skip,
-      take: limit,
       orderBy: { createdAt: "desc" },
-    });
+    })) as LaunchWithRelations[];
 
-    const total = await prisma.launch.count();
+    const launchesWithStatus: LaunchWithStatus[] =
+      launches.map(mapLaunchWithStatus);
 
-    const launchesWithStatus: LaunchWithStatus[] = launches
-      .map((launch : any) => {
-        const totalPurchased = launch.purchases.reduce(
-          (sum: number, p : any)  => sum + p.amount,
-          0,
-        );
-        const status = computeStatus({
-          ...launch,
-          totalPurchased,
-        });
+    const filtered = hasStatusQuery
+      ? statusFilter
+        ? launchesWithStatus.filter((launch) => launch.status === statusFilter)
+        : []
+      : launchesWithStatus;
 
-        return {
-          id: launch.id,
-          creatorId: launch.creatorId,
-          name: launch.name,
-          symbol: launch.symbol,
-          totalSupply: launch.totalSupply,
-          pricePerToken: launch.pricePerToken,
-          startsAt: launch.startsAt,
-          endsAt: launch.endsAt,
-          maxPerWallet: launch.maxPerWallet,
-          description: launch.description,
-          createdAt: launch.createdAt,
-          updatedAt: launch.updatedAt,
-          status,
-          tiers: launch.tiers,
-          vestingConfig: launch.vestingConfig,
-        };
-      })
-      .filter((launch : any) => !statusFilter || launch.status === statusFilter);
+    const total = filtered.length;
+    const paged = filtered.slice(skip, skip + limit);
 
     res.status(200).json({
-      launches: launchesWithStatus,
+      launches: paged,
       total,
       page,
       limit,
@@ -327,45 +506,20 @@ app.get("/api/launches/:id", async (req: Request, res: Response) => {
   const { id } = req.params;
 
   try {
-    const launch = await prisma.launch.findUnique({
+    const launch = (await prisma.launch.findUnique({
       where: { id },
       include: {
         tiers: true,
         vestingConfig: true,
         purchases: { select: { amount: true } },
       },
-    });
+    })) as LaunchWithRelations | null;
 
     if (!launch) {
       return res.status(404).json({ error: "Launch not found" });
     }
 
-    const totalPurchased = launch.purchases.reduce(
-      (sum: number, p : any) => sum + p.amount,
-      0,
-    );
-    const status = computeStatus({
-      ...launch,
-      totalPurchased,
-    });
-
-    const response: LaunchWithStatus = {
-      id: launch.id,
-      creatorId: launch.creatorId,
-      name: launch.name,
-      symbol: launch.symbol,
-      totalSupply: launch.totalSupply,
-      pricePerToken: launch.pricePerToken,
-      startsAt: launch.startsAt,
-      endsAt: launch.endsAt,
-      maxPerWallet: launch.maxPerWallet,
-      description: launch.description,
-      createdAt: launch.createdAt,
-      updatedAt: launch.updatedAt,
-      status,
-      tiers: launch.tiers,
-      vestingConfig: launch.vestingConfig,
-    };
+    const response: LaunchWithStatus = mapLaunchWithStatus(launch);
 
     res.status(200).json(response);
   } catch (error) {
@@ -378,6 +532,11 @@ app.put(
   authMiddleware,
   async (req: AuthRequest, res: Response) => {
     const { id } = req.params;
+    const parsed = parseBody(updateLaunchSchema, req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Invalid input" });
+    }
+
     const {
       name,
       symbol,
@@ -387,7 +546,7 @@ app.put(
       endsAt,
       maxPerWallet,
       description,
-    } = req.body;
+    } = parsed.data;
 
     try {
       const launch = await prisma.launch.findUnique({
@@ -404,7 +563,13 @@ app.put(
       }
 
       if (launch.creatorId !== req.user!.id) {
-        return res.status(403).json({ error: "Unauthorized" });
+        return res.status(403).json({ error: "Not creator" });
+      }
+
+      const effectiveStartsAt = startsAt ?? launch.startsAt;
+      const effectiveEndsAt = endsAt ?? launch.endsAt;
+      if (effectiveEndsAt <= effectiveStartsAt) {
+        return res.status(400).json({ error: "Invalid input" });
       }
 
       const updated = await prisma.launch.update({
@@ -413,27 +578,20 @@ app.put(
           name: name !== undefined ? name : launch.name,
           symbol: symbol !== undefined ? symbol : launch.symbol,
           totalSupply:
-            totalSupply !== undefined
-              ? parseInt(totalSupply)
-              : launch.totalSupply,
+            totalSupply !== undefined ? totalSupply : launch.totalSupply,
           pricePerToken:
-            pricePerToken !== undefined
-              ? parseFloat(pricePerToken)
-              : launch.pricePerToken,
-          startsAt:
-            startsAt !== undefined ? new Date(startsAt) : launch.startsAt,
-          endsAt: endsAt !== undefined ? new Date(endsAt) : launch.endsAt,
+            pricePerToken !== undefined ? pricePerToken : launch.pricePerToken,
+          startsAt: effectiveStartsAt,
+          endsAt: effectiveEndsAt,
           maxPerWallet:
-            maxPerWallet !== undefined
-              ? parseInt(maxPerWallet)
-              : launch.maxPerWallet,
+            maxPerWallet !== undefined ? maxPerWallet : launch.maxPerWallet,
           description:
             description !== undefined ? description : launch.description,
         },
       });
 
       const totalPurchased = launch.purchases.reduce(
-        (sum: number, p : any) => sum + p.amount,
+        (sum, purchase) => sum + purchase.amount,
         0,
       );
       const status = computeStatus({
@@ -475,11 +633,12 @@ app.post(
   authMiddleware,
   async (req: AuthRequest, res: Response) => {
     const { id } = req.params;
-    const { addresses } = req.body;
-
-    if (!addresses || !Array.isArray(addresses)) {
-      return res.status(400).json({ error: "Invalid addresses" });
+    const parsed = parseBody(addWhitelistSchema, req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Invalid input" });
     }
+
+    const { addresses } = parsed.data;
 
     try {
       const launch = await prisma.launch.findUnique({ where: { id } });
@@ -488,25 +647,29 @@ app.post(
       }
 
       if (launch.creatorId !== req.user!.id) {
-        return res.status(403).json({ error: "Unauthorized" });
+        return res.status(403).json({ error: "Not creator" });
       }
 
       const existing = await prisma.whitelistEntry.findMany({
         where: { launchId: id },
         select: { address: true },
       });
-      const existingAddresses = new Set(existing.map((e : any) => e.address));
+      const existingAddresses = new Set(existing.map((entry) => entry.address));
+      const uniqueIncoming = Array.from(
+        new Set(addresses.map((address) => address.trim()).filter(Boolean)),
+      );
+      const newAddresses = uniqueIncoming.filter(
+        (address) => !existingAddresses.has(address),
+      );
 
-      let added = 0;
-      for (const address of addresses) {
-        if (!existingAddresses.has(address)) {
-          await prisma.whitelistEntry.create({
-            data: { launchId: id, address },
-          });
-          added++;
-        }
+      if (newAddresses.length > 0) {
+        await prisma.whitelistEntry.createMany({
+          data: newAddresses.map((address) => ({ launchId: id, address })),
+          skipDuplicates: true,
+        });
       }
 
+      const added = newAddresses.length;
       const total = existingAddresses.size + added;
       res.status(200).json({ added, total });
     } catch (error) {
@@ -528,7 +691,7 @@ app.get(
       }
 
       if (launch.creatorId !== req.user!.id) {
-        return res.status(403).json({ error: "Unauthorized" });
+        return res.status(403).json({ error: "Not creator" });
       }
 
       const whitelistEntries = await prisma.whitelistEntry.findMany({
@@ -536,7 +699,7 @@ app.get(
       });
 
       res.status(200).json({
-        addresses: whitelistEntries.map((e : any) => e.address),
+        addresses: whitelistEntries.map((entry) => entry.address),
         total: whitelistEntries.length,
       });
     } catch (error) {
@@ -558,7 +721,7 @@ app.delete(
       }
 
       if (launch.creatorId !== req.user!.id) {
-        return res.status(403).json({ error: "Unauthorized" });
+        return res.status(403).json({ error: "Not creator" });
       }
 
       const deleted = await prisma.whitelistEntry.deleteMany({
@@ -587,11 +750,12 @@ app.post(
   authMiddleware,
   async (req: AuthRequest, res: Response) => {
     const { id } = req.params;
-    const { code, discountPercent, maxUses } = req.body;
-
-    if (!code || discountPercent === undefined || maxUses === undefined) {
-      return res.status(400).json({ error: "Missing required fields" });
+    const parsed = parseBody(createReferralSchema, req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Invalid input" });
     }
+
+    const { code, discountPercent, maxUses } = parsed.data;
 
     try {
       const launch = await prisma.launch.findUnique({ where: { id } });
@@ -600,7 +764,7 @@ app.post(
       }
 
       if (launch.creatorId !== req.user!.id) {
-        return res.status(403).json({ error: "Unauthorized" });
+        return res.status(403).json({ error: "Not creator" });
       }
 
       const existing = await prisma.referralCode.findUnique({
@@ -616,8 +780,8 @@ app.post(
         data: {
           launchId: id,
           code,
-          discountPercent: parseInt(discountPercent),
-          maxUses: parseInt(maxUses),
+          discountPercent,
+          maxUses,
           usedCount: 0,
         },
       });
@@ -648,7 +812,7 @@ app.get(
       }
 
       if (launch.creatorId !== req.user!.id) {
-        return res.status(403).json({ error: "Unauthorized" });
+        return res.status(403).json({ error: "Not creator" });
       }
 
       const referrals = await prisma.referralCode.findMany({
@@ -671,11 +835,12 @@ app.post(
   authMiddleware,
   async (req: AuthRequest, res: Response) => {
     const { id } = req.params;
-    const { walletAddress, amount, txSignature, referralCode } = req.body;
-
-    if (!walletAddress || !amount || !txSignature) {
-      return res.status(400).json({ error: "Missing required fields" });
+    const parsed = parseBody(purchaseTokensSchema, req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Invalid input" });
     }
+
+    const { walletAddress, amount, txSignature, referralCode } = parsed.data;
 
     try {
       const launch = await prisma.launch.findUnique({
@@ -688,11 +853,13 @@ app.post(
       }
 
       // Check launch status
-      const totalPurchased = launch.purchases.reduce(
-        (sum : number, p : any) => sum + p.amount,
-        0,
-      );
-      const status = computeStatus({ ...launch, totalPurchased });
+      const alreadySold = await getTotalPurchased(id);
+      const status = computeStatus({
+        startsAt: launch.startsAt,
+        endsAt: launch.endsAt,
+        totalSupply: launch.totalSupply,
+        totalPurchased: alreadySold,
+      });
 
       if (status !== "ACTIVE") {
         return res.status(400).json({
@@ -707,7 +874,7 @@ app.post(
 
       if (whitelist.length > 0) {
         const isWhitelisted = whitelist.some(
-          (w : any) => w.address === walletAddress,
+          (entry) => entry.address === walletAddress,
         );
         if (!isWhitelisted) {
           return res
@@ -730,7 +897,7 @@ app.post(
       }
 
       // Check total supply
-      if (totalPurchased + amount > launch.totalSupply) {
+      if (alreadySold + amount > launch.totalSupply) {
         return res.status(400).json({ error: "Exceeds total supply" });
       }
 
@@ -745,30 +912,17 @@ app.post(
       }
 
       // Calculate cost with tiered pricing
-      let totalCost = 0;
-      let remaining = amount;
-
-      if (launch.tiers && launch.tiers.length > 0) {
-        for (const tier of launch.tiers) {
-          if (remaining <= 0) break;
-
-          const capacity = tier.maxAmount - tier.minAmount;
-          const toFillInTier = Math.min(remaining, capacity);
-          totalCost += toFillInTier * tier.pricePerToken;
-          remaining -= toFillInTier;
-        }
-
-        // Overflow beyond all tiers uses flat pricePerToken
-        if (remaining > 0) {
-          totalCost += remaining * launch.pricePerToken;
-        }
-      } else {
-        totalCost = amount * launch.pricePerToken;
-      }
+      const totalCost = calculateTieredCost(
+        amount,
+        alreadySold,
+        launch.tiers,
+        launch.pricePerToken,
+      );
 
       // Apply referral discount
       let finalCost = totalCost;
       let referralCodeId: string | null = null;
+      let referralMaxUses: number | null = null;
 
       if (referralCode) {
         const refCode = await prisma.referralCode.findUnique({
@@ -783,31 +937,57 @@ app.post(
           return res.status(400).json({ error: "Referral code exhausted" });
         }
 
-        const discount = (totalCost * refCode.discountPercent) / 100;
+        const discount = Math.floor(
+          (totalCost * refCode.discountPercent) / 100,
+        );
         finalCost = totalCost - discount;
         referralCodeId = refCode.id;
-
-        // Increment referral usage
-        await prisma.referralCode.update({
-          where: { id: refCode.id },
-          data: { usedCount: { increment: 1 } },
-        });
+        referralMaxUses = refCode.maxUses;
       }
 
-      const purchase = await prisma.purchase.create({
-        data: {
-          launchId: id,
-          userId: req.user!.id,
-          walletAddress,
-          amount: parseInt(amount),
-          totalCost: finalCost,
-          txSignature,
-          referralCodeId,
-        },
-      });
+      const purchase = referralCodeId
+        ? await prisma.$transaction(async (tx) => {
+            const updated = await tx.referralCode.updateMany({
+              where: {
+                id: referralCodeId,
+                usedCount: { lt: referralMaxUses! },
+              },
+              data: { usedCount: { increment: 1 } },
+            });
+
+            if (updated.count === 0) {
+              throw new Error("REFERRAL_EXHAUSTED");
+            }
+
+            return tx.purchase.create({
+              data: {
+                launchId: id,
+                userId: req.user!.id,
+                walletAddress,
+                amount,
+                totalCost: finalCost,
+                txSignature,
+                referralCodeId,
+              },
+            });
+          })
+        : await prisma.purchase.create({
+            data: {
+              launchId: id,
+              userId: req.user!.id,
+              walletAddress,
+              amount,
+              totalCost: finalCost,
+              txSignature,
+              referralCodeId,
+            },
+          });
 
       res.status(201).json(purchase);
     } catch (error) {
+      if (error instanceof Error && error.message === "REFERRAL_EXHAUSTED") {
+        return res.status(400).json({ error: "Referral code exhausted" });
+      }
       res.status(500).json({ error: "Internal server error" });
     }
   },
@@ -879,7 +1059,7 @@ app.get("/api/launches/:id/vesting", async (req: Request, res: Response) => {
     });
 
     const totalPurchased = purchases.reduce(
-      (sum: number, p :any) => sum + p.amount,
+      (sum, purchase) => sum + purchase.amount,
       0,
     );
 
@@ -899,40 +1079,19 @@ app.get("/api/launches/:id/vesting", async (req: Request, res: Response) => {
     const vesting = launch.vestingConfig;
     const firstPurchaseTime =
       purchases.length > 0 ? purchases[0].createdAt : new Date();
-    const tgeAmount = Math.floor((totalPurchased * vesting.tgePercent) / 100);
-    const cliffEndsAt = new Date(
-      firstPurchaseTime.getTime() + vesting.cliffDays * 24 * 60 * 60 * 1000,
-    );
-
-    const now = new Date();
-    let vestedAmount = tgeAmount;
-    let claimableAmount = tgeAmount;
-    let lockedAmount = totalPurchased - tgeAmount;
-
-    if (now > cliffEndsAt) {
-      const vestingStart = new Date(
-        firstPurchaseTime.getTime() + vesting.cliffDays * 24 * 60 * 60 * 1000,
-      );
-      const vestingEnd = new Date(
-        vestingStart.getTime() + vesting.vestingDays * 24 * 60 * 60 * 1000,
-      );
-
-      if (now >= vestingEnd) {
-        vestedAmount = totalPurchased;
-        claimableAmount = totalPurchased;
-        lockedAmount = 0;
-      } else {
-        const elapsed = now.getTime() - vestingStart.getTime();
-        const totalVestingTime = vesting.vestingDays * 24 * 60 * 60 * 1000;
-        const vestingProgress = elapsed / totalVestingTime;
-        const releasedAfterCliff = Math.floor(
-          (totalPurchased - tgeAmount) * vestingProgress,
-        );
-        vestedAmount = tgeAmount + releasedAfterCliff;
-        claimableAmount = vestedAmount;
-        lockedAmount = totalPurchased - vestedAmount;
-      }
-    }
+    const {
+      tgeAmount,
+      cliffEndsAt,
+      vestedAmount,
+      lockedAmount,
+      claimableAmount,
+    } = computeVestingState({
+      totalPurchased,
+      firstPurchaseTime,
+      cliffDays: vesting.cliffDays,
+      vestingDays: vesting.vestingDays,
+      tgePercent: vesting.tgePercent,
+    });
 
     res.status(200).json({
       totalPurchased,
